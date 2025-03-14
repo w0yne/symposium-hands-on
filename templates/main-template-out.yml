@@ -31,9 +31,11 @@ Parameters:
   Q05pMaxTokens:
     Type: String
     Description: Maximum number of tokens in a chunk
+    Default: ''
   Q06pOverlapPercentage:
     Type: String
     Description: Percent overlap in each chunk
+    Default: ''
   Q07pVectorStore:
     Type: String
     Description: Select VectorStore

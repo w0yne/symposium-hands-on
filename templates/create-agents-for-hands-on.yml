@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Deploy Medical Expert Agents for Bedrock'
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: 'S3 bucket name containing Lambda function code (e.g., symposium-hands-on-250318)'
+    Default: 'symposium-hands-on-250318'
+
+Resources:
+  # Shared Lambda execution role for both functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAgentCreationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:AttachRolePolicy
+                  - iam:PassRole
+                  - iam:PutRolePolicy
+                  - sts:GetCallerIdentity
+                  - bedrock:PrepareAgent
+                  - bedrock:CreateAgentAlias
+                  - bedrock:GetAgent
+                  - bedrock:CreateAgent
+                  - bedrock:CreateAgentActionGroup
+                  - bedrock:CreateAgentVersion
+                  - lambda:ListFunctions
+                  - lambda:GetFunction
+                  - lambda:InvokeFunction
+                Resource: '*'
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${S3BucketName}/*'
+
+  # Medical Writing Expert Lambda Function
+  WritingExpertLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: create-agent-Medical-Writing-Expert
+      Handler: create-agent-Medical-Writing-Expert.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: 'artifacts/create-agent-Medical-Writing-Expert.zip'
+
+  # PubMed Expert Lambda Function
+  PubMedExpertLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: create-agent-Medical-Pubmed-Expert
+      Handler: create-agent-Medical-Pubmed-Expert.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        S3Bucket: !Ref S3BucketName
+        S3Key: 'artifacts/create-agent-Medical-Pubmed-Expert.zip'
+
+  # Custom resource to invoke Writing Expert Lambda
+  WritingExpertInvocation:
+    Type: 'Custom::WritingExpertInvocation'
+    DependsOn: WritingExpertLambda
+    Properties:
+      ServiceToken: !GetAtt WritingExpertInvoker.Arn
+      FunctionName: !Ref WritingExpertLambda
+
+  # Custom resource Lambda to invoke the Writing Expert Lambda
+  WritingExpertInvoker:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              print('Event: ' + json.dumps(event))
+              
+              # Only execute on Create or Update
+              if event['RequestType'] in ['Create', 'Update']:
+                  try:
+                      lambda_client = boto3.client('lambda')
+                      function_name = event['ResourceProperties']['FunctionName']
+                      
+                      print(f"Invoking Lambda function: {function_name}")
+                      response = lambda_client.invoke(
+                          FunctionName=function_name,
+                          InvocationType='RequestResponse'
+                      )
+                      
+                      payload = json.loads(response['Payload'].read().decode('utf-8'))
+                      print(f"Lambda response: {json.dumps(payload)}")
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                      {'Message': f'Successfully executed {function_name}'})
+                  except Exception as e:
+                      print(f"Error: {str(e)}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                      {'Error': str(e)})
+              else:
+                  # For Delete requests, just return success
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                  {'Message': 'No action required for Delete'})
+
+  # Custom resource to invoke PubMed Expert Lambda
+  PubMedExpertInvocation:
+    Type: 'Custom::PubMedExpertInvocation'
+    DependsOn: 
+      - PubMedExpertLambda
+      - WritingExpertInvocation  # Ensure this runs after Writing Expert
+    Properties:
+      ServiceToken: !GetAtt PubMedExpertInvoker.Arn
+      FunctionName: !Ref PubMedExpertLambda
+
+  # Custom resource Lambda to invoke the PubMed Expert Lambda
+  PubMedExpertInvoker:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              print('Event: ' + json.dumps(event))
+              
+              # Only execute on Create or Update
+              if event['RequestType'] in ['Create', 'Update']:
+                  try:
+                      lambda_client = boto3.client('lambda')
+                      function_name = event['ResourceProperties']['FunctionName']
+                      
+                      print(f"Invoking Lambda function: {function_name}")
+                      response = lambda_client.invoke(
+                          FunctionName=function_name,
+                          InvocationType='RequestResponse'
+                      )
+                      
+                      payload = json.loads(response['Payload'].read().decode('utf-8'))
+                      print(f"Lambda response: {json.dumps(payload)}")
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                      {'Message': f'Successfully executed {function_name}'})
+                  except Exception as e:
+                      print(f"Error: {str(e)}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                      {'Error': str(e)})
+              else:
+                  # For Delete requests, just return success
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                  {'Message': 'No action required for Delete'})
+
+Outputs:
+  WritingExpertLambda:
+    Description: The Writing Expert Lambda function
+    Value: !Ref WritingExpertLambda
+  
+  PubMedExpertLambda:
+    Description: The PubMed Expert Lambda function
+    Value: !Ref PubMedExpertLambda

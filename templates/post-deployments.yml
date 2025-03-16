@@ -1,0 +1,28 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Post-deployment stack to synchronize knowledge base and create agents.'
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Default: ''
+    Description: Name of the resources bucket
+
+Resources:
+  SyncKnowledgeBase:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: 
+        Fn::Sub: https://${S3BucketName}.s3.amazonaws.com/templates/sync-knowledgebase-datasource.yml
+      Parameters:
+        # Define parameters required by sync-knowledgebase-datasource.yml
+        KnowledgeBaseName: 'medical-product-kb'
+
+  CreateAgents:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: 
+        Fn::Sub: https://${S3BucketName}.s3.amazonaws.com/templates/create-agents-for-hands-on.yml
+      Parameters:
+        # Define parameters required by create-agents-for-hands-on.yml
+        S3BucketName: 
+          Ref: S3BucketName

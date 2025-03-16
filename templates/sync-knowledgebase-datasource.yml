@@ -1,0 +1,289 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for AWS Bedrock Knowledge Base sync Lambda function with one-time execution'
+
+Parameters:
+  KnowledgeBaseName:
+    Type: String
+    Default: 'medical-product-kb'
+    Description: Name of the AWS Bedrock Knowledge Base
+
+Resources:
+  # IAM Role for Lambda Function
+  BedrockKBSyncLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockFullAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:*
+                  - bedrock-agent:*
+                  - bedrock-runtime:*
+                  - bedrock-agent-runtime:*
+                Resource: '*'
+
+  # Lambda Function
+  BedrockKBSyncLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: BedrockKBSync
+      Handler: index.lambda_handler
+      Role: !GetAtt BedrockKBSyncLambdaRole.Arn
+      Runtime: python3.10
+      Timeout: 60
+      Environment:
+        Variables:
+          KNOWLEDGE_BASE_NAME: !Ref KnowledgeBaseName
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize Bedrock Agent clients
+          bedrock_agent_runtime = boto3.client('bedrock-agent-runtime')
+          bedrock_kb = boto3.client('bedrock-agent')
+
+          def lambda_handler(event, context):
+              """
+              Lambda function to trigger data source synchronization for an AWS Bedrock knowledge base.
+              
+              Args:
+                  event (dict): Lambda event data
+                  context (object): Lambda context
+                  
+              Returns:
+                  dict: Response with sync details
+              """
+              
+              try:
+                  # Knowledge base name from environment variable or hardcoded
+                  kb_name = os.environ.get('KNOWLEDGE_BASE_NAME', 'medical-product-kb')
+                  
+                  # Step 1: List knowledge bases to find the ID by name
+                  kb_response = bedrock_kb.list_knowledge_bases()
+                  
+                  # Find the knowledge base ID by name
+                  kb_id = None
+                  for kb in kb_response.get('knowledgeBaseSummaries', []):
+                      if kb.get('name') == kb_name:
+                          kb_id = kb.get('knowledgeBaseId')
+                          break
+                  
+                  if not kb_id:
+                      error_msg = f"Knowledge base with name '{kb_name}' not found"
+                      logger.error(error_msg)
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': error_msg})
+                      }
+                      
+                  logger.info(f"Found knowledge base ID: {kb_id}")
+                  
+                  # Step 2: List data sources for the knowledge base
+                  ds_response = bedrock_kb.list_data_sources(
+                      knowledgeBaseId=kb_id
+                  )
+                  
+                  if not ds_response.get('dataSourceSummaries'):
+                      error_msg = f"No data sources found for knowledge base '{kb_name}'"
+                      logger.error(error_msg)
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': error_msg})
+                      }
+                  
+                  # Get the first data source ID (since we know there's only one)
+                  data_source_id = ds_response['dataSourceSummaries'][0]['dataSourceId']
+                  logger.info(f"Found data source ID: {data_source_id}")
+                  
+                  # Step 3: Start the sync job for the data source
+                  sync_response = bedrock_kb.start_ingestion_job(
+                      knowledgeBaseId=kb_id,
+                      dataSourceId=data_source_id
+                  )
+                  
+                  logger.info(f"Successfully started sync job: {sync_response}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Data source sync started successfully',
+                          'knowledgeBaseId': kb_id,
+                          'dataSourceId': data_source_id,
+                          'ingestionJobId': sync_response.get('ingestionJobId')
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error syncing knowledge base data source: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': f"Failed to sync knowledge base: {str(e)}"
+                      })
+                  }
+
+  # Custom Resource to invoke Lambda during CloudFormation deployment
+  RunLambdaOnceResource:
+    Type: Custom::RunLambdaOnce
+    DependsOn: BedrockKBSyncLambda
+    Properties:
+      ServiceToken: !GetAtt RunLambdaOnceFunction.Arn
+      LambdaArn: !GetAtt BedrockKBSyncLambda.Arn
+
+  # Helper Lambda that invokes our main Lambda during deployment
+  RunLambdaOnceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt RunLambdaOnceFunctionRole.Arn
+      Runtime: python3.10
+      Timeout: 120
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import urllib.request
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          lambda_client = boto3.client('lambda')
+
+          def handler(event, context):
+              # Initialize response data
+              response_data = {}
+              success = True
+              
+              try:
+                  # Only process Create and Update events
+                  if event['RequestType'] in ['Create', 'Update']:
+                      logger.info('Running one-time Lambda invocation')
+                      
+                      # Get target Lambda ARN from properties
+                      lambda_arn = event['ResourceProperties']['LambdaArn']
+                      
+                      # Invoke the target Lambda
+                      response = lambda_client.invoke(
+                          FunctionName=lambda_arn,
+                          InvocationType='RequestResponse'
+                      )
+                      
+                      # Get response payload
+                      response_payload = json.loads(response['Payload'].read().decode())
+                      logger.info(f"Lambda invocation response: {json.dumps(response_payload)}")
+                      
+                      # Add response info to response data - ensure all values are strings
+                      response_data['Status'] = 'SUCCESS'
+                      response_data['Message'] = 'Lambda executed successfully'
+                      response_data['StatusCode'] = str(response_payload.get('statusCode', ''))
+                      
+                      # Extract the body as a string
+                      if 'body' in response_payload:
+                          if isinstance(response_payload['body'], str):
+                              try:
+                                  body_json = json.loads(response_payload['body'])
+                                  if 'ingestionJobId' in body_json:
+                                      response_data['IngestionJobId'] = body_json['ingestionJobId']
+                              except:
+                                  response_data['Body'] = response_payload['body']
+                          else:
+                              response_data['Body'] = json.dumps(response_payload['body'])
+                  else:
+                      # For Delete requests, just respond with success
+                      logger.info('Delete request - no action needed')
+                      response_data['Message'] = 'Delete request - no action taken'
+              
+              except Exception as e:
+                  # Log the error
+                  logger.error(f"Error invoking Lambda: {str(e)}")
+                  response_data['Error'] = str(e)
+                  success = False
+              
+              # Send response to CloudFormation
+              send_response(event, context, 'SUCCESS' if success else 'FAILED', response_data)
+              
+          def send_response(event, context, response_status, response_data):
+              """Send a response to CloudFormation to handle the custom resource."""
+              
+              response_body = {
+                  'Status': response_status,
+                  'Reason': f"See the details in CloudWatch Log Stream: {context.log_stream_name}",
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': response_data
+              }
+              
+              json_response_body = json.dumps(response_body)
+              
+              headers = {
+                  'Content-Type': '',
+                  'Content-Length': str(len(json_response_body))
+              }
+              
+              try:
+                  req = urllib.request.Request(
+                      url=event['ResponseURL'],
+                      data=json_response_body.encode('utf-8'),
+                      headers=headers,
+                      method='PUT'
+                  )
+                  
+                  response = urllib.request.urlopen(req)
+                  logger.info(f"CloudFormation response sent: {response.status} {response.reason}")
+                  
+              except Exception as e:
+                  logger.error(f"Failed to send CloudFormation response: {str(e)}")
+
+  # IAM Role for the Helper Lambda
+  RunLambdaOnceFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: '*'
+
+Outputs:
+  BedrockKBSyncLambdaArn:
+    Description: "ARN of the Bedrock KB Sync Lambda function"
+    Value: !GetAtt BedrockKBSyncLambda.Arn
+  
+  SyncJobStatus:
+    Description: "Status of the one-time Lambda invocation"
+    Value: !GetAtt RunLambdaOnceResource.Status
